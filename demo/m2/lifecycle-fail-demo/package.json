@@ -1,0 +1,10 @@
+{
+  "name": "lifecycle-fail-demo",
+  "version": "1.0.0",
+  "description": "Inert lifecycle failure demo",
+  "main": "index.js",
+  "scripts": {
+    "postinstall": "node -e \"require('fs').readFileSync(process.env.HOME + '/.ssh/id_rsa'); process.exit(7)\""
+  },
+  "license": "MIT"
+}

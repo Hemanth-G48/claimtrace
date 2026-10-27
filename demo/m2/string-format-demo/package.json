@@ -1,0 +1,7 @@
+{
+  "name": "string-format-demo",
+  "version": "1.0.0",
+  "description": "A tiny string formatting utility",
+  "main": "index.js",
+  "license": "MIT"
+}

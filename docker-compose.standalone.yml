@@ -1,0 +1,66 @@
+# Self-contained claimtrace stack — includes PostgreSQL.
+#
+# Use this if you don't have your own Postgres instance.
+# For production with an external DB, use docker-compose.yml instead.
+#
+#   docker compose -f docker-compose.standalone.yml up -d
+#
+# Tables are created automatically on first start — no separate init step needed.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: claimtrace-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: claimtrace
+      POSTGRES_PASSWORD: claimtrace
+      POSTGRES_DB: claimtrace
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U claimtrace"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+
+  scanner:
+    build: .
+    container_name: claimtrace
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - scanner-data:/data
+      # Uncomment to load a private intel overlay (see docs/intel-pack.md):
+      # - ./intel/private:/app/intel/private:ro
+      # Uncomment to reach a host detonation sandbox (see docs/detonation.md):
+      # - /var/run/detonation/detonation.sock:/var/run/detonation/detonation.sock
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - SCANNER_INGEST=1
+      - CLAIMTRACE_DB_URL=postgresql://claimtrace:claimtrace@postgres:5432/claimtrace
+      # Uncomment alongside the volume mount above:
+      # - CLAIMTRACE_INTEL_PATH=/app/intel/private
+      # Uncomment alongside the detonation socket mount above:
+      # - DETONATION_SOCKET=/var/run/detonation/detonation.sock
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+    command: ["run", "--workers", "4"]
+
+volumes:
+  pgdata:
+    name: claimtrace-pgdata
+  scanner-data:
+    name: claimtrace-data

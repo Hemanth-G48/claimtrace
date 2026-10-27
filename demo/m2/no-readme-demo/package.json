@@ -1,0 +1,7 @@
+{
+  "name": "no-readme-demo",
+  "version": "1.0.0",
+  "description": "Inert demo with no README",
+  "main": "index.js",
+  "license": "MIT"
+}

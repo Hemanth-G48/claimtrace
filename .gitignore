@@ -1,0 +1,103 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+build/
+dist/
+!tests/corpus/**/dist/
+!tests/corpus/**/dist/**
+*.egg
+.venv/
+venv/
+env/
+
+# Scanner runtime
+*.db
+*.db-journal
+*.sqlite
+*.sqlite-journal
+pypi_scanner.db
+pypi_scanner_diff_cache/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+# draw.io editor temp/lock files (appear while a diagram is open)
+.$*.dtmp
+*.dtmp
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+
+# SQLite WAL/shm
+*.db-shm
+*.db-wal
+
+# Private intel pack — overlay loaded at runtime via CLAIMTRACE_INTEL_PATH.
+# The public baseline lives at claimtrace/intel/baseline/ and IS tracked.
+# Leading slash anchors this pattern to the repo root so it does NOT also
+# match `claimtrace/intel/` or `tests/intel/`.
+/intel/
+
+# Internal session state
+HANDOFF.md
+
+# Loose scratch tree is committed compressed as scratch-archive.tar.xz instead
+# (the embtest venv is regenerable and excluded entirely).
+/.scratch/
+
+# Stale workspace artifacts
+pypi_scanner/
+qc.py
+
+# Binary build artifacts (detonation Go service)
+*.exe
+detonation/detonation-svc
+detonation/bin/
+
+# Home-dir dotfiles + harness state that can appear when this tree lives in a
+# home directory; not part of the project.
+.bashrc
+.bash_profile
+.bash_logout
+.zshrc
+.profile
+.claude/
+.git.broken-bak
+
+# distributed-worker host list (IPs/keys) — never commit
+tools/worker-hosts.conf
+
+# Local malware-analysis scratch — downloaded samples + decoded payload layers.
+# NEVER commit live malware. Kept on disk for RE/detonation, ignored by git.
+tmp_inspect/
+
+# Demo harness scratch (synthetic sdists, vault, sqlite DB)
+/demo/.work/
+
+# Office lock files and generated report artifacts (keep the source reports)
+.~lock.*
+/reports/artifacts/
+
+# Documentation and generated report folders are kept locally but are not part
+# of the implementation repository. Keep only the four project-level documents.
+/docs/
+/reports/
+/*.md
+!/ARCHITECTURE.md
+!/PROJECT.md
+!/problem_statement.md
+!/README.md

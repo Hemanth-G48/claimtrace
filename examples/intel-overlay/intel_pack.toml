@@ -1,0 +1,4 @@
+name = "claimtrace-demo-overlay"
+version = "0.1.0"
+extends = "baseline"
+license = "AGPL-3.0-or-later"

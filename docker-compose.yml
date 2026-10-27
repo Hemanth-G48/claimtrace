@@ -1,0 +1,52 @@
+# Production compose — BYO Postgres + optional detonation + optional intel overlay.
+# For a self-contained setup with bundled Postgres, use docker-compose.standalone.yml.
+#
+# Requires CLAIMTRACE_DB_URL in .env pointing at your Postgres instance.
+# Detonation and intel overlay mounts are optional — remove them if not deployed.
+
+services:
+  scanner:
+    build:
+      context: .
+      args:
+        CLAIMTRACE_BUILD_SHA: ${CLAIMTRACE_BUILD_SHA:-unknown}
+    container_name: claimtrace
+    restart: unless-stopped
+    volumes:
+      - scanner-data:/data
+      # Frozen-sample vault (used only when CLAIMTRACE_VAULT_PATH is set).
+      - vault-data:/data/vault
+      # Optional: detonation sandbox socket (see docs/detonation.md)
+      - /var/run/detonation/detonation.sock:/var/run/detonation/detonation.sock
+      # Shared staging dir so the detonation service (host-side) can
+      # bind-mount archives the scanner creates inside the container.
+      - /tmp/claimtrace:/tmp/claimtrace
+      # Optional: private intel overlay (see docs/intel-pack.md)
+      - ./intel/private:/app/intel/private:ro
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - SCANNER_INGEST=1
+      - DETONATION_SOCKET=/var/run/detonation/detonation.sock
+      - CLAIMTRACE_INTEL_PATH=/app/intel/private
+      # npm structurally out-paces one host, so cap its claim share harder and
+      # give gomod/pypi/crates a bigger equal floor (they CAN stay current).
+      # High-priority line-jumpers are unaffected (they beat all normal backlog).
+      - SCHED_MAX_ECO_SHARE=0.5
+      - SCHED_RESERVED_FRACTION=0.5
+      # Deployment-specific tuning — e.g. WATCHLIST_AUTO_BLOCKLIST, the false-positive
+      # exit-ramp (comma-separated "eco:name" entries never auto-watchlisted) — lives
+      # in .env so it stays out of version control. See .env.example.
+    deploy:
+      resources:
+        limits:
+          cpus: "4.0"
+          memory: 6G
+    command: ["run", "--workers", "7"]
+
+volumes:
+  scanner-data:
+    name: claimtrace-data
+  vault-data:
+    name: claimtrace-vault

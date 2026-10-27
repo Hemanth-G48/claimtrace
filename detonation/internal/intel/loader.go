@@ -1,0 +1,211 @@
+// Package intel loads detection-content data (sensitive path/env lists,
+// shell binaries, per-ecosystem noise filters) from TOML files.
+//
+// At startup it always loads the embedded baseline (compiled into the
+// binary). If CLAIMTRACE_INTEL_PATH is set, it additionally loads any
+// matching files under $CLAIMTRACE_INTEL_PATH/detonation/ and UNION-merges
+// their lists into the baseline. This mirrors the Python engine's
+// claimtrace/intel/__init__.py behavior — same env var, same merge model.
+package intel
+
+import (
+	"embed"
+	"fmt"
+	"log"
+	"os"
+	"path/filepath"
+
+	"github.com/BurntSushi/toml"
+)
+
+//go:embed baseline/rules_data.toml baseline/noise_baseline.toml
+var baselineFS embed.FS
+
+// RulesData is the data half of the detonation behavioral rules.
+// The closures that actually match these against trace events live in
+// internal/rules — this struct is just the tunable inputs.
+type RulesData struct {
+	SensitivePathPrefixes []string `toml:"sensitive_path_prefixes"`
+	SensitiveEnvPrefixes  []string `toml:"sensitive_env_prefixes"`
+	ShellBinaries         []string `toml:"shell_binaries"`
+}
+
+// NoiseFilters is the per-ecosystem noise-event filter data.
+// The Filter function in internal/baseline reads these to drop expected,
+// normal pip/npm/cargo behavior from the trace stream.
+type NoiseFilters struct {
+	PypiFileNoise   []string `toml:"pypi_file_noise"`
+	PypiExecNoise   []string `toml:"pypi_exec_noise"`
+	NpmFileNoise    []string `toml:"npm_file_noise"`
+	NpmExecNoise    []string `toml:"npm_exec_noise"`
+	CratesFileNoise []string `toml:"crates_file_noise"`
+	CratesExecNoise []string `toml:"crates_exec_noise"`
+	GomodFileNoise  []string `toml:"gomod_file_noise"`
+	GomodExecNoise  []string `toml:"gomod_exec_noise"`
+
+	// Per-ecosystem network destination allowlist. Entries are hostnames
+	// (resolved to IPs at filter time) or literal IPs. Connections to these
+	// destinations are expected registry/CDN traffic and are dropped before
+	// the network exfil rules run.
+	PypiNetAllow   []string `toml:"pypi_net_allow"`
+	NpmNetAllow    []string `toml:"npm_net_allow"`
+	CratesNetAllow []string `toml:"crates_net_allow"`
+	GomodNetAllow  []string `toml:"gomod_net_allow"`
+
+	// Abuse-prone serverless / tunnel hosting domains (workers.dev, vercel.app,
+	// ngrok, …). These sit behind a big provider's shared CDN IPs, so an IP-based
+	// allowlist waves them through even though they're disproportionately C2/exfil.
+	// Matched by HOSTNAME (DNS-aware): a connect resolving one is never allowlisted
+	// and fires dyn_abuse_hosting_callback. Shared across ecosystems.
+	AbuseHosts []string `toml:"abuse_hosts"`
+}
+
+// Pack holds everything intel.Load() returns.
+type Pack struct {
+	Rules  RulesData
+	Noise  NoiseFilters
+	Source string // human-readable label: "baseline" or "baseline+overlay"
+}
+
+var loaded *Pack
+
+// Load reads baseline + overlay, merges, and caches the result.
+// Idempotent — subsequent calls return the same Pack.
+func Load() *Pack {
+	if loaded != nil {
+		return loaded
+	}
+
+	pack := &Pack{Source: "baseline"}
+
+	// Embedded baseline — always loaded.
+	if err := unmarshalEmbedded("baseline/rules_data.toml", &pack.Rules); err != nil {
+		log.Printf("intel: failed to parse embedded baseline rules_data.toml: %v", err)
+	}
+	if err := unmarshalEmbedded("baseline/noise_baseline.toml", &pack.Noise); err != nil {
+		log.Printf("intel: failed to parse embedded baseline noise_baseline.toml: %v", err)
+	}
+
+	// Optional overlay from CLAIMTRACE_INTEL_PATH/detonation/.
+	overlayRoot := os.Getenv("CLAIMTRACE_INTEL_PATH")
+	if overlayRoot != "" {
+		overlayDir := filepath.Join(overlayRoot, "detonation")
+		if dirExists(overlayDir) {
+			var overlayRules RulesData
+			rulesPath := filepath.Join(overlayDir, "rules_data.toml")
+			if fileExists(rulesPath) {
+				if _, err := toml.DecodeFile(rulesPath, &overlayRules); err != nil {
+					log.Printf("intel: failed to parse overlay %s: %v", rulesPath, err)
+				} else {
+					pack.Rules = mergeRules(pack.Rules, overlayRules)
+					pack.Source = "baseline+overlay"
+				}
+			}
+			var overlayNoise NoiseFilters
+			noisePath := filepath.Join(overlayDir, "noise_baseline.toml")
+			if fileExists(noisePath) {
+				if _, err := toml.DecodeFile(noisePath, &overlayNoise); err != nil {
+					log.Printf("intel: failed to parse overlay %s: %v", noisePath, err)
+				} else {
+					pack.Noise = mergeNoise(pack.Noise, overlayNoise)
+					pack.Source = "baseline+overlay"
+				}
+			}
+		}
+	}
+
+	n := pack.Noise
+	log.Printf(
+		"intel_loaded source=%s sensitive_paths=%d sensitive_envs=%d shells=%d "+
+			"pypi_file/exec/net=%d/%d/%d npm_file/exec/net=%d/%d/%d "+
+			"crates_file/exec/net=%d/%d/%d gomod_file/exec/net=%d/%d/%d",
+		pack.Source,
+		len(pack.Rules.SensitivePathPrefixes),
+		len(pack.Rules.SensitiveEnvPrefixes),
+		len(pack.Rules.ShellBinaries),
+		len(n.PypiFileNoise), len(n.PypiExecNoise), len(n.PypiNetAllow),
+		len(n.NpmFileNoise), len(n.NpmExecNoise), len(n.NpmNetAllow),
+		len(n.CratesFileNoise), len(n.CratesExecNoise), len(n.CratesNetAllow),
+		len(n.GomodFileNoise), len(n.GomodExecNoise), len(n.GomodNetAllow),
+	)
+
+	loaded = pack
+	return pack
+}
+
+// Current returns the loaded pack, calling Load() lazily if needed.
+func Current() *Pack {
+	if loaded == nil {
+		return Load()
+	}
+	return loaded
+}
+
+// Reset clears the cached pack — test-only helper.
+func Reset() {
+	loaded = nil
+}
+
+func unmarshalEmbedded(name string, dst any) error {
+	data, err := baselineFS.ReadFile(name)
+	if err != nil {
+		return fmt.Errorf("read embedded %s: %w", name, err)
+	}
+	return toml.Unmarshal(data, dst)
+}
+
+func fileExists(p string) bool {
+	info, err := os.Stat(p)
+	return err == nil && !info.IsDir()
+}
+
+func dirExists(p string) bool {
+	info, err := os.Stat(p)
+	return err == nil && info.IsDir()
+}
+
+func mergeRules(base, overlay RulesData) RulesData {
+	return RulesData{
+		SensitivePathPrefixes: unionStrings(base.SensitivePathPrefixes, overlay.SensitivePathPrefixes),
+		SensitiveEnvPrefixes:  unionStrings(base.SensitiveEnvPrefixes, overlay.SensitiveEnvPrefixes),
+		ShellBinaries:         unionStrings(base.ShellBinaries, overlay.ShellBinaries),
+	}
+}
+
+func mergeNoise(base, overlay NoiseFilters) NoiseFilters {
+	return NoiseFilters{
+		PypiFileNoise:   unionStrings(base.PypiFileNoise, overlay.PypiFileNoise),
+		PypiExecNoise:   unionStrings(base.PypiExecNoise, overlay.PypiExecNoise),
+		NpmFileNoise:    unionStrings(base.NpmFileNoise, overlay.NpmFileNoise),
+		NpmExecNoise:    unionStrings(base.NpmExecNoise, overlay.NpmExecNoise),
+		CratesFileNoise: unionStrings(base.CratesFileNoise, overlay.CratesFileNoise),
+		CratesExecNoise: unionStrings(base.CratesExecNoise, overlay.CratesExecNoise),
+		GomodFileNoise:  unionStrings(base.GomodFileNoise, overlay.GomodFileNoise),
+		GomodExecNoise:  unionStrings(base.GomodExecNoise, overlay.GomodExecNoise),
+		PypiNetAllow:    unionStrings(base.PypiNetAllow, overlay.PypiNetAllow),
+		NpmNetAllow:     unionStrings(base.NpmNetAllow, overlay.NpmNetAllow),
+		CratesNetAllow:  unionStrings(base.CratesNetAllow, overlay.CratesNetAllow),
+		GomodNetAllow:   unionStrings(base.GomodNetAllow, overlay.GomodNetAllow),
+		AbuseHosts:      unionStrings(base.AbuseHosts, overlay.AbuseHosts),
+	}
+}
+
+func unionStrings(base, overlay []string) []string {
+	seen := make(map[string]struct{}, len(base)+len(overlay))
+	out := make([]string, 0, len(base)+len(overlay))
+	for _, v := range base {
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	for _, v := range overlay {
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	return out
+}

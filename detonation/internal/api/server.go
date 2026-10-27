@@ -1,0 +1,311 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+package api
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"detonation/internal/assess"
+	"detonation/internal/baseline"
+	"detonation/internal/dnslog"
+	"detonation/internal/rules"
+	"detonation/internal/sandbox"
+	"detonation/internal/trace"
+)
+
+type Config struct {
+	MaxConcurrent     int
+	BaseDir           string
+	SocketPath        string
+	ListenAddr        string
+	TetragonLogPath   string
+	DNSForwarderImage string // image for the dns-forwarder container; "" disables DNS capture
+}
+
+type Server struct {
+	config Config
+	mux    *http.ServeMux
+	engine *rules.Engine
+	dns    *dnslog.Manager
+	active atomic.Int32
+	mu     sync.Mutex
+}
+
+type DetonateRequest struct {
+	Ecosystem      string `json:"ecosystem"`
+	Name           string `json:"name"`
+	Version        string `json:"version"`
+	ArchivePath    string `json:"archive_path"`
+	ArchiveKind    string `json:"archive_kind"`
+	TimeoutSeconds int    `json:"timeout_seconds,omitempty"`
+}
+
+type DetonateResponse struct {
+	ID           string                 `json:"id"`
+	Status       string                 `json:"status"`
+	InstallPhase *sandbox.PhaseResult   `json:"install_phase,omitempty"`
+	ImportPhase  *sandbox.PhaseResult   `json:"import_phase,omitempty"`
+	Findings     []trace.DynFinding     `json:"findings"`
+	TraceEvents  []trace.TraceEvent     `json:"trace_events"`
+	TraceSummary map[string]interface{} `json:"trace_summary"`
+}
+
+func NewServer(cfg Config) *Server {
+	s := &Server{
+		config: cfg,
+		mux:    http.NewServeMux(),
+		engine: rules.NewEngine(rules.AllRules()),
+		dns:    dnslog.StartManager(cfg.DNSForwarderImage),
+	}
+	if s.dns.Enabled() {
+		log.Printf("dns capture: enabled (forwarder at %s)", s.dns.DNSServer())
+	} else {
+		// Loud: with DNS capture off the abuse-host rule (dyn_abuse_hosting_callback)
+		// is inert and connects are judged by shared-CDN IP only — a silently degraded
+		// security posture an operator must be able to see at a glance.
+		log.Printf("WARNING dns capture: DISABLED — abuse-host detection (dyn_abuse_hosting_callback) is INERT and connects fall back to IP matching. Build the dns-forwarder image into rootless Docker to enable.")
+	}
+	s.mux.HandleFunc("/api/v1/health", s.handleHealth)
+	s.mux.HandleFunc("/api/v1/detonate", s.handleDetonate)
+	s.mux.HandleFunc("/api/v1/assess", s.handleAssess)
+	return s
+}
+
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	s.mux.ServeHTTP(w, r)
+}
+
+func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	resp := map[string]interface{}{
+		"status":             "ok",
+		"active_detonations": s.active.Load(),
+		"max_concurrent":     s.config.MaxConcurrent,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+func (s *Server) handleAssess(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	var req assess.Request
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), 400)
+		return
+	}
+	if req.Ecosystem == "" || req.Name == "" || req.Version == "" || req.ArchivePath == "" {
+		http.Error(w, "missing required fields: ecosystem, name, version, archive_path", 400)
+		return
+	}
+	if req.Ecosystem != "npm" {
+		http.Error(w, "Milestone 2 local assessment supports npm only", 400)
+		return
+	}
+	if !assess.ValidPackageName(req.Name) {
+		http.Error(w, "invalid npm package name", 400)
+		return
+	}
+	if !filepath.IsAbs(req.ArchivePath) {
+		http.Error(w, "archive_path must be absolute", 400)
+		return
+	}
+	info, err := os.Stat(req.ArchivePath)
+	if err != nil {
+		http.Error(w, "archive_path not readable: "+err.Error(), 400)
+		return
+	}
+	if !info.Mode().IsRegular() {
+		http.Error(w, "archive_path must be a regular file", 400)
+		return
+	}
+	if int(s.active.Load()) >= s.config.MaxConcurrent {
+		http.Error(w, "too many concurrent assessments", 429)
+		return
+	}
+	s.active.Add(1)
+	defer s.active.Add(-1)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(assess.Run(r.Context(), req))
+}
+
+func (s *Server) handleDetonate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+
+	var req DetonateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), 400)
+		return
+	}
+	if req.Ecosystem == "" || req.Name == "" || req.Version == "" || req.ArchivePath == "" {
+		http.Error(w, "missing required fields: ecosystem, name, version, archive_path", 400)
+		return
+	}
+
+	profile := sandbox.GetProfile(req.Ecosystem)
+	if profile == nil {
+		http.Error(w, fmt.Sprintf("unsupported ecosystem: %s", req.Ecosystem), 400)
+		return
+	}
+
+	if int(s.active.Load()) >= s.config.MaxConcurrent {
+		http.Error(w, "too many concurrent detonations", 429)
+		return
+	}
+
+	s.active.Add(1)
+	defer s.active.Add(-1)
+
+	resp := s.runDetonation(r.Context(), req)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+func (s *Server) runDetonation(ctx context.Context, req DetonateRequest) DetonateResponse {
+	sb, err := sandbox.New(req.Ecosystem, req.ArchivePath, s.config.BaseDir)
+	if err != nil {
+		return DetonateResponse{Status: "error", Findings: []trace.DynFinding{},
+			TraceSummary: map[string]interface{}{"error": err.Error()}}
+	}
+	sb.Config.DNSServer = s.dns.DNSServer() // "" when DNS capture is disabled
+
+	if err := sb.Setup(); err != nil {
+		return DetonateResponse{ID: sb.Config.ID, Status: "error", Findings: []trace.DynFinding{},
+			TraceSummary: map[string]interface{}{"error": "setup failed: " + err.Error()}}
+	}
+	defer sb.Destroy()
+
+	// Mark the window we'll use to filter Tetragon events.
+	traceStart := time.Now().UTC()
+
+	installResult, err := sb.RunInstall(ctx, req.Name, req.Version)
+	if err != nil {
+		return DetonateResponse{
+			ID: sb.Config.ID, Status: "error",
+			Findings:     []trace.DynFinding{},
+			TraceSummary: map[string]interface{}{"error": "install failed: " + err.Error()},
+		}
+	}
+	// Boundary between the install and import phases — events on or before this
+	// instant are attributed to install, later events to import.
+	installEnd := time.Now().UTC()
+
+	importResult, err := sb.RunImport(ctx, req.Name)
+	if err != nil {
+		importResult = &sandbox.PhaseResult{ExitCode: -1, Duration: 0, TimedOut: false}
+	}
+	importEnd := time.Now().UTC()
+
+	// Trace events: read Tetragon's JSONL log for the install/import time
+	// window, attributed to this sandbox's container(s) so concurrent
+	// detonations and host activity don't bleed in. If id capture failed, fall
+	// back to the time window alone rather than returning nothing.
+	containerIDs := sb.ContainerIDs()
+	if len(containerIDs) == 0 {
+		log.Printf("detonate: no container id captured for %s/%s; trace not container-filtered", req.Ecosystem, req.Name)
+	}
+	rawEvents := trace.CollectFromTetragonLog(
+		s.config.TetragonLogPath,
+		traceStart,
+		importEnd,
+		containerIDs,
+	)
+	// Tag each event with its phase before rule evaluation — dyn_install_exfil
+	// and dyn_import_exfil key off TraceEvent.Phase, which the collector leaves
+	// empty.
+	trace.AssignPhase(rawEvents, installEnd)
+	// DNS-aware: tag each outbound connect with the domain the package resolved,
+	// so the filter allows/denies by hostname instead of by shared-CDN IP and the
+	// abuse-hosting rule can fire. No-op when DNS capture is disabled.
+	if s.dns.Enabled() {
+		hostCache := map[string]string{} // dedup docker-exec lookups per distinct addr
+		for i := range rawEvents {
+			e := &rawEvents[i]
+			if e.Category != "network" || e.Operation != "connect" {
+				continue
+			}
+			addr, _ := e.Detail["addr"].(string)
+			if addr == "" {
+				continue
+			}
+			host, seen := hostCache[addr]
+			if !seen {
+				if h, ok := s.dns.Lookup(addr); ok {
+					host = h
+				}
+				hostCache[addr] = host // cache misses (empty) too
+			}
+			if host != "" {
+				e.Detail["hostname"] = host
+			}
+		}
+	}
+	filtered := baseline.Filter(req.Ecosystem, rawEvents)
+	findings := s.engine.Evaluate(filtered)
+	if findings == nil {
+		findings = []trace.DynFinding{}
+	}
+
+	status := "completed"
+	if installResult.TimedOut || (importResult != nil && importResult.TimedOut) {
+		status = "timeout"
+	}
+
+	categoryCounts := map[string]int{}
+	for _, evt := range filtered {
+		categoryCounts[evt.Category]++
+	}
+
+	return DetonateResponse{
+		ID:           sb.Config.ID,
+		Status:       status,
+		InstallPhase: installResult,
+		ImportPhase:  importResult,
+		Findings:     findings,
+		TraceEvents:  filtered,
+		TraceSummary: map[string]interface{}{
+			"total_events":       len(rawEvents),
+			"events_by_category": categoryCounts,
+		},
+	}
+}
+
+func (s *Server) ListenAndServe() error {
+	httpServer := &http.Server{Handler: s}
+
+	if s.config.SocketPath != "" {
+		os.Remove(s.config.SocketPath)
+		ln, err := net.Listen("unix", s.config.SocketPath)
+		if err != nil {
+			return fmt.Errorf("listen unix %s: %w", s.config.SocketPath, err)
+		}
+		os.Chmod(s.config.SocketPath, 0o660)
+		log.Printf("listening on unix://%s", s.config.SocketPath)
+		return httpServer.Serve(ln)
+	}
+
+	addr := s.config.ListenAddr
+	if addr == "" {
+		addr = "127.0.0.1:9100"
+	}
+	log.Printf("listening on %s", addr)
+	httpServer.Addr = addr
+	return httpServer.ListenAndServe()
+}

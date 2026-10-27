@@ -1,0 +1,177 @@
+# Embedded baseline for the detonation Go service.
+# Mirror of claimtrace/intel/baseline/detonation/noise_baseline.toml.
+# Overlay via $CLAIMTRACE_INTEL_PATH/detonation/noise_baseline.toml — UNION semantics.
+
+pypi_file_noise = [
+    "/site-packages/",
+    "/.cache/pip/",
+    "/tmp/pip-",
+    "/__pycache__/",
+    "/pip/_vendor/",
+    ".dist-info/",
+    ".egg-info/",
+]
+
+pypi_exec_noise = [
+    "/python",
+    "/pip",
+]
+
+npm_file_noise = [
+    "/.npm/_cacache/",
+    "/.npm/_logs/",
+    "/node_modules/",
+    "/tmp/npm-",
+    "/.npmrc",
+]
+
+npm_exec_noise = [
+    "/node",
+    "/npm",
+]
+
+crates_file_noise = [
+    "/.cargo/registry/",
+    "/.cargo/bin/",
+    "/.rustup/",
+    "/target/",
+]
+
+crates_exec_noise = [
+    "/rustc",
+    "/cargo",
+    "/rustup",
+]
+
+gomod_file_noise = [
+    "/go/pkg/mod/",
+    "/go/pkg/",
+    "/root/.cache/go-build/",
+    "/.cache/go-build/",
+    "/usr/local/go/",
+]
+
+gomod_exec_noise = [
+    "/go",
+    "/compile",
+    "/link",
+    "/asm",
+    "/vet",
+    "/gofmt",
+    "/unzip",
+    "/tar",
+]
+
+# Per-ecosystem network destination allowlist. Entries may be hostnames (resolved
+# to IPs at detonation time), literal IPs, or CIDR ranges. Connections to these
+# expected registry / CDN endpoints are dropped before the network exfil rules
+# run, so normal dependency fetches don't false-positive as
+# dyn_install_exfil/dyn_import_exfil.
+#
+# CIDR ranges cover the CDN fronts whose IPs rotate faster than per-detonation DNS
+# resolution can track — the dominant dyn_install_exfil FP source (mined from the
+# trace_event table: 700+ install-phase connects to a single Fastly IP, etc.).
+# Tradeoff (intentional): a C2 hosted *on* one of these shared CDNs is dropped at
+# the dynamic layer; the static IOC/opengrep layers still see the exfil URL in
+# source, so the package is not blind. Ranges are scoped per-ecosystem to the
+# CDN its registry actually sits behind, not blanket cloud allowlisting.
+#   Fastly       151.101.0.0/16, 146.75.0.0/16, 199.232.0.0/16  (PyPI/pythonhosted, npm)
+#   Cloudflare   104.16.0.0/13                                   (npm, jsdelivr, unpkg, crates)
+#   Google       142.250.0.0/15, 64.233.160.0/19, 192.178.0.0/15 (Go module proxy)
+#   AWS CloudFront 3.160.0.0/14                                  (S3-backed release assets)
+pypi_net_allow = [
+    "pypi.org",
+    "files.pythonhosted.org",
+    "github.com",
+    "objects.githubusercontent.com",
+    "raw.githubusercontent.com",
+    "151.101.0.0/16",   # Fastly (pythonhosted/pypi front)
+    "146.75.0.0/16",    # Fastly
+    "199.232.0.0/16",   # Fastly
+]
+
+npm_net_allow = [
+    "registry.npmjs.org",
+    "registry.yarnpkg.com",
+    "github.com",
+    "codeload.github.com",
+    "objects.githubusercontent.com",
+    "raw.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+    "nodejs.org",
+    "registry.npmmirror.com",
+    "npmmirror.com",
+    "cdn.jsdelivr.net",
+    "unpkg.com",
+    "yarnpkg.com",
+    # Prebuilt-binary install CDNs (Playwright/Puppeteer browser downloads) — these
+    # fire dyn_install_exfil at install otherwise (e.g. nodefisher pulling browsers).
+    "cdn.playwright.dev",
+    "playwright.download.prss.microsoft.com",
+    "playwright.azureedge.net",
+    # SheetJS self-hosts its distribution off-registry; packages that bundle/depend on
+    # xlsx fetch from here at install (e.g. vue-openlayers-plugin). Legit CDN.
+    "cdn.sheetjs.com",
+    # EXACT-only: path-style GCS is a shared prebuilt-binary CDN (Playwright/Puppeteer
+    # host browsers here). The "=" keeps per-tenant buckets — "<bucket>.storage.
+    # googleapis.com", the dep-confusion exfil shape (corporate-front-vue) — FLAGGED.
+    "=storage.googleapis.com",
+    "104.16.0.0/13",    # Cloudflare (npmjs/jsdelivr/unpkg front)
+    "151.101.0.0/16",   # Fastly
+    "146.75.0.0/16",    # Fastly
+    "199.232.0.0/16",   # Fastly
+    "3.160.0.0/14",     # AWS CloudFront (release assets)
+]
+
+crates_net_allow = [
+    "crates.io",
+    "static.crates.io",
+    "index.crates.io",
+    "github.com",
+    "objects.githubusercontent.com",
+    "codeload.github.com",
+    "104.16.0.0/13",    # Cloudflare (crates.io front)
+    "3.160.0.0/14",     # AWS CloudFront (static.crates.io)
+]
+
+gomod_net_allow = [
+    "proxy.golang.org",
+    "sum.golang.org",
+    "storage.googleapis.com",
+    "github.com",
+    "objects.githubusercontent.com",
+    "gopkg.in",
+    "golang.org",
+    "goproxy.io",
+    "142.250.0.0/15",   # Google (proxy.golang.org / googleapis front)
+    "64.233.160.0/19",  # Google
+    "192.178.0.0/15",   # Google
+]
+
+# Abuse-prone serverless / tunnel hosting. Matched by HOSTNAME (DNS-aware) — a
+# connect resolving one of these is never allowlisted (even though its IP belongs
+# to a trusted CDN/provider range above) and fires dyn_abuse_hosting_callback.
+# These hosts are disproportionately used for malware C2 / install-time exfil
+# precisely because they inherit a big provider's trusted IPs. Heavy-legit app
+# hosts (vercel.app/netlify.app/herokuapp.com) are intentionally omitted to avoid
+# false positives on legitimate apps; operators can add them via the overlay.
+abuse_hosts = [
+    "workers.dev",
+    "pages.dev",
+    "trycloudflare.com",
+    "r2.dev",
+    "ngrok.io",
+    "ngrok-free.app",
+    "ngrok.app",
+    "ngrok.dev",
+    "deno.dev",
+    "val.run",
+    "glitch.me",
+    "repl.co",
+    "replit.dev",
+    "surge.sh",
+    "serveo.net",
+    "loca.lt",
+    "telebit.io",
+    "webhook.cool",
+]
